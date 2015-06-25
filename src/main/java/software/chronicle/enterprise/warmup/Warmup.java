@@ -6,10 +6,11 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
-import java.lang.reflect.Method;
+import java.lang.reflect.*;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.regex.Pattern;
 
@@ -23,9 +24,26 @@ import java.util.regex.Pattern;
  */
 public class Warmup {
     private static final WhiteBox WHITE_BOX = WhiteBox.getWhiteBox();
-    private final Map<String, Integer> methodToCompLevelMap;
+    private static final int MAX_COMP_LEVEL = 4;
+    private static final ClassValue<AtomicBoolean> CLASS_COMPILED = new ClassValue<AtomicBoolean>() {
+        @Override
+        protected AtomicBoolean computeValue(Class<?> type) {
+            return new AtomicBoolean();
+        }
+    };
 
-    public Warmup(Map<String, Integer> methodToCompLevelMap) {
+    static {
+        CLASS_COMPILED.get(WhiteBox.class).set(true);
+        CLASS_COMPILED.get(Warmup.class).set(true);
+    }
+
+    private final Map<Executable, Integer> methodToCompLevelMap;
+
+    public Warmup() {
+        this.methodToCompLevelMap = new LinkedHashMap<>();
+    }
+
+    private Warmup(Map<Executable, Integer> methodToCompLevelMap) {
         this.methodToCompLevelMap = methodToCompLevelMap;
     }
 
@@ -37,36 +55,79 @@ public class Warmup {
                 pcs.put(pc.id, pc);
             }
         }
-        final Map<String, Integer> methodToCompLevelMap = new LinkedHashMap<>();
+        final Map<String, Integer> methodNameToCompLevelMap = new LinkedHashMap<>();
         for (PrintCompilation pc : pcs.values()) {
             if (pc == null || pc.state != null) continue;
-            methodToCompLevelMap.put(pc.methodName, pc.compLevel);
+            methodNameToCompLevelMap.put(pc.methodName, pc.compLevel);
         }
-        return new Warmup(methodToCompLevelMap);
-    }
-
-    public void dump(BiConsumer<String, Integer> consumer) {
-        for (Map.Entry<String, Integer> entry : methodToCompLevelMap.entrySet()) {
-            consumer.accept(entry.getKey(), entry.getValue());
-        }
-    }
-
-    public void start() {
         Pattern pattern = Pattern.compile("::");
-        for (Map.Entry<String, Integer> entry : methodToCompLevelMap.entrySet()) {
+        Map<Executable, Integer> methodToCompLevelMap = new LinkedHashMap<>();
+        for (Map.Entry<String, Integer> entry : methodNameToCompLevelMap.entrySet()) {
             String[] part = pattern.split(entry.getKey(), 2);
             try {
                 Class<?> aClass = Class.forName(part[0]);
-                for (Method method : aClass.getDeclaredMethods()) {
-                    if (method.getName().equals(part[1])) {
-                        System.out.println(method + ", level=" + entry.getValue());
-                        WHITE_BOX.enqueueMethodForCompilation(method, entry.getValue());
+                if (part[1].equals("<init>")) {
+                    for (Constructor constructor : aClass.getDeclaredConstructors())
+                        methodToCompLevelMap.putIfAbsent(constructor, entry.getValue());
+                } else {
+                    for (Method method : aClass.getDeclaredMethods()) {
+                        if (method.getName().equals(part[1])) {
+                            methodToCompLevelMap.putIfAbsent(method, entry.getValue());
+                        }
                     }
                 }
             } catch (ClassNotFoundException e) {
                 System.out.println("skipping " + part[0]);
             }
         }
+        return new Warmup(methodToCompLevelMap);
+    }
+
+    public void dump(BiConsumer<Executable, Integer> consumer) {
+        for (Map.Entry<Executable, Integer> entry : methodToCompLevelMap.entrySet()) {
+            consumer.accept(entry.getKey(), entry.getValue());
+        }
+    }
+
+    public void start() {
+        for (Map.Entry<Executable, Integer> entry : methodToCompLevelMap.entrySet()) {
+            WHITE_BOX.enqueueMethodForCompilation(entry.getKey(), entry.getValue());
+        }
+    }
+
+    public void compileClass(Class clazz) {
+        if (CLASS_COMPILED.get(clazz).getAndSet(true))
+            return;
+        Class superclass = clazz.getSuperclass();
+        if (superclass != null)
+            compileClass(clazz);
+        for (Constructor constructor : clazz.getDeclaredConstructors()) {
+            methodToCompLevelMap.put(constructor, MAX_COMP_LEVEL);
+            compileExecutable(constructor);
+        }
+        for (Method method : clazz.getDeclaredMethods()) {
+            if ((method.getModifiers() & (Modifier.ABSTRACT | Modifier.NATIVE)) == 0) {
+                methodToCompLevelMap.put(method, MAX_COMP_LEVEL);
+            }
+            for (Class aClass : method.getParameterTypes()) {
+                compileClass(aClass);
+            }
+        }
+        for (Field field : clazz.getDeclaredFields()) {
+            Class<?> type = field.getType();
+            compileClass(type);
+        }
+    }
+
+    private void compileExecutable(Executable executable) {
+        for (Class aClass : executable.getExceptionTypes()) {
+            compileClass(aClass);
+        }
+        for (Class aClass : executable.getParameterTypes()) {
+            compileClass(aClass);
+        }
+        if (executable instanceof Method)
+            compileClass(((Method) executable).getReturnType());
     }
 
     public void waitFor() {
@@ -87,6 +148,6 @@ public class Warmup {
     }
 
     void endOfTheCompilationQueue() {
-
+        // dummy method so we know we have finished compiling.
     }
 }
