@@ -7,9 +7,7 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
 import java.lang.reflect.*;
-import java.util.LinkedHashMap;
-import java.util.Map;
-import java.util.TreeMap;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.regex.Pattern;
@@ -23,8 +21,9 @@ import java.util.regex.Pattern;
  -Xbootclasspath/p:/home/peter/git/Chronicle-WarmUp/target/classes
  */
 public class Warmup {
+    public static final int HIGH_COMP_LEVEL = 3;
+    public static final int MAX_COMP_LEVEL = 4;
     private static final WhiteBox WHITE_BOX = WhiteBox.getWhiteBox();
-    private static final int MAX_COMP_LEVEL = 4;
     private static final ClassValue<AtomicBoolean> CLASS_COMPILED = new ClassValue<AtomicBoolean>() {
         @Override
         protected AtomicBoolean computeValue(Class<?> type) {
@@ -90,61 +89,122 @@ public class Warmup {
     }
 
     public void start() {
+        Method waitFor = getEOTCQMethod();
+        WHITE_BOX.deoptimizeMethod(waitFor);
         for (Map.Entry<Executable, Integer> entry : methodToCompLevelMap.entrySet()) {
-            WHITE_BOX.enqueueMethodForCompilation(entry.getKey(), entry.getValue());
+//            System.out.println(entry.getKey()+" =>" + entry.getValue());
+            if (WHITE_BOX.getCompileQueuesSize() > 128)
+                try {
+                    Thread.sleep(1);
+                } catch (InterruptedException e) {
+                    throw new IllegalStateException(e);
+                }
+            Executable executable = entry.getKey();
+            int bci = WHITE_BOX.getMethodEntryBci(executable);
+            WHITE_BOX.enqueueMethodForCompilation(executable, entry.getValue(), bci);
+        }
+    }
+
+    public void compileForInstance(Object o) {
+        compileForInstance(o, HIGH_COMP_LEVEL);
+    }
+
+    public void compileForInstance(Object o, int compLevel) {
+        compileForInstance(o, compLevel, Collections.newSetFromMap(new IdentityHashMap<>()));
+    }
+
+    private void compileForInstance(Object o, int compLevel, Set<Object> objs) {
+        if (o == null || !objs.add(o)) return;
+        compileClass(o.getClass(), compLevel);
+
+        for (Class oClass = o.getClass(); oClass != null; oClass = oClass.getSuperclass()) {
+            for (Field field : o.getClass().getDeclaredFields()) {
+                field.setAccessible(true);
+                try {
+                    if (field.getType().isPrimitive())
+                        continue;
+                    Object fieldValue = field.get(o);
+                    if (fieldValue != null)
+                        compileForInstance(fieldValue, compLevel, objs);
+                } catch (IllegalAccessException e) {
+                    // ignored
+                }
+            }
         }
     }
 
     public void compileClass(Class clazz) {
+        compileClass(clazz, HIGH_COMP_LEVEL);
+    }
+
+    public void compileClass(Class clazz, int compLevel) {
         if (CLASS_COMPILED.get(clazz).getAndSet(true))
             return;
         Class superclass = clazz.getSuperclass();
         if (superclass != null)
-            compileClass(clazz);
+            compileClass(clazz, compLevel);
+        for (Class iClass : clazz.getInterfaces())
+            compileClass(iClass, compLevel);
         for (Constructor constructor : clazz.getDeclaredConstructors()) {
-            methodToCompLevelMap.put(constructor, MAX_COMP_LEVEL);
-            compileExecutable(constructor);
+            if (WHITE_BOX.isMethodCompilable(constructor))
+                methodToCompLevelMap.put(constructor, compLevel);
+            compileExecutable(constructor, compLevel);
         }
         for (Method method : clazz.getDeclaredMethods()) {
-            if ((method.getModifiers() & (Modifier.ABSTRACT | Modifier.NATIVE)) == 0) {
-                methodToCompLevelMap.put(method, MAX_COMP_LEVEL);
-            }
+            if ((method.getModifiers() & Modifier.NATIVE) == 0 && WHITE_BOX.isMethodCompilable(method))
+                methodToCompLevelMap.put(method, compLevel);
+
             for (Class aClass : method.getParameterTypes()) {
-                compileClass(aClass);
+                compileClass(aClass, compLevel);
             }
         }
         for (Field field : clazz.getDeclaredFields()) {
             Class<?> type = field.getType();
-            compileClass(type);
+            compileClass(type, compLevel);
         }
     }
 
-    private void compileExecutable(Executable executable) {
+    private void compileExecutable(Executable executable, int compLevel) {
         for (Class aClass : executable.getExceptionTypes()) {
-            compileClass(aClass);
+            compileClass(aClass, compLevel);
         }
         for (Class aClass : executable.getParameterTypes()) {
-            compileClass(aClass);
+            compileClass(aClass, compLevel);
         }
         if (executable instanceof Method)
-            compileClass(((Method) executable).getReturnType());
+            compileClass(((Method) executable).getReturnType(), compLevel);
     }
 
     public void waitFor() {
+        Method waitFor = getEOTCQMethod();
+        WHITE_BOX.enqueueMethodForCompilation(waitFor, 1);
+        for (int i = 0; i < 200; i++)
+            if (waitFor0(waitFor))
+                break;
+    }
+
+    private Method getEOTCQMethod() {
         Method waitFor;
         try {
             waitFor = Warmup.class.getDeclaredMethod("endOfTheCompilationQueue");
         } catch (NoSuchMethodException e) {
             throw new AssertionError(e);
         }
-        WHITE_BOX.deoptimizeMethod(waitFor);
-        WHITE_BOX.enqueueMethodForCompilation(waitFor, 3);
+        assert WHITE_BOX.isMethodCompilable(waitFor);
+        return waitFor;
+    }
+
+    private boolean waitFor0(Method waitFor) {
         try {
-            while (!WHITE_BOX.isMethodCompiled(waitFor))
-                Thread.sleep(1);
+            if (WHITE_BOX.isMethodCompiled(waitFor)) {
+                return true;
+            }
+            Thread.sleep(10);
+
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+        return false;
     }
 
     void endOfTheCompilationQueue() {
