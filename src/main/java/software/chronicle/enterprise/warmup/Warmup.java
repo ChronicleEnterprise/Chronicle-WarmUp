@@ -51,6 +51,10 @@ public class Warmup {
         this.methodToCompLevelMap = methodToCompLevelMap;
     }
 
+    public static boolean isEnabled() {
+        return WHITE_BOX instanceof RealWhiteBox;
+    }
+
     public static Warmup compileFromFile(File file) throws IOException {
         Map<Integer, PrintCompilation> pcs = new TreeMap<>();
         try (BufferedReader br = new BufferedReader(new FileReader(file))) {
