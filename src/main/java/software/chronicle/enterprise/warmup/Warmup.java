@@ -10,6 +10,7 @@ import java.lang.reflect.*;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
+import java.util.logging.Logger;
 import java.util.regex.Pattern;
 
 /**
@@ -23,7 +24,8 @@ import java.util.regex.Pattern;
 public class Warmup {
     public static final int HIGH_COMP_LEVEL = 3;
     public static final int MAX_COMP_LEVEL = 4;
-    private static final WhiteBox WHITE_BOX = WhiteBox.getWhiteBox();
+    public static final IWhiteBox WHITE_BOX = IWhiteBox.instance();
+    private static final Logger LOGGER = Logger.getLogger(Warmup.class.getName());
     private static final ClassValue<AtomicBoolean> CLASS_COMPILED = new ClassValue<AtomicBoolean>() {
         @Override
         protected AtomicBoolean computeValue(Class<?> type) {
@@ -34,12 +36,15 @@ public class Warmup {
     static {
         CLASS_COMPILED.get(WhiteBox.class).set(true);
         CLASS_COMPILED.get(Warmup.class).set(true);
+        if (WHITE_BOX == NoWhiteBox.INSTANCE) {
+            LOGGER.warning("WhiteBox not loaded. Make sure it is on the -Xbootclasspath/a:Chronicle-WhiteBox.jar");
+        }
     }
 
     private final Map<Executable, Integer> methodToCompLevelMap;
 
     public Warmup() {
-        this.methodToCompLevelMap = new LinkedHashMap<>();
+        this(new LinkedHashMap<>());
     }
 
     private Warmup(Map<Executable, Integer> methodToCompLevelMap) {
@@ -145,22 +150,34 @@ public class Warmup {
             compileClass(clazz, compLevel);
         for (Class iClass : clazz.getInterfaces())
             compileClass(iClass, compLevel);
-        for (Constructor constructor : clazz.getDeclaredConstructors()) {
-            if (WHITE_BOX.isMethodCompilable(constructor))
-                methodToCompLevelMap.put(constructor, compLevel);
-            compileExecutable(constructor, compLevel);
-        }
-        for (Method method : clazz.getDeclaredMethods()) {
-            if ((method.getModifiers() & Modifier.NATIVE) == 0 && WHITE_BOX.isMethodCompilable(method))
-                methodToCompLevelMap.put(method, compLevel);
-
-            for (Class aClass : method.getParameterTypes()) {
-                compileClass(aClass, compLevel);
+        try {
+            for (Constructor constructor : clazz.getDeclaredConstructors()) {
+                if (WHITE_BOX.isMethodCompilable(constructor))
+                    methodToCompLevelMap.put(constructor, compLevel);
+                compileExecutable(constructor, compLevel);
             }
+        } catch (Throwable e) {
+            LOGGER.warning("Failed to get constructors for " + clazz + " " + e);
         }
-        for (Field field : clazz.getDeclaredFields()) {
-            Class<?> type = field.getType();
-            compileClass(type, compLevel);
+        try {
+            for (Method method : clazz.getDeclaredMethods()) {
+                if ((method.getModifiers() & Modifier.NATIVE) == 0 && WHITE_BOX.isMethodCompilable(method))
+                    methodToCompLevelMap.put(method, compLevel);
+
+                for (Class aClass : method.getParameterTypes()) {
+                    compileClass(aClass, compLevel);
+                }
+            }
+        } catch (Throwable e) {
+            LOGGER.warning("Failed to get methods for " + clazz + " " + e);
+        }
+        try {
+            for (Field field : clazz.getDeclaredFields()) {
+                Class<?> type = field.getType();
+                compileClass(type, compLevel);
+            }
+        } catch (Throwable e) {
+            LOGGER.warning("Failed to get fields for " + clazz + " " + e);
         }
     }
 
@@ -177,7 +194,7 @@ public class Warmup {
 
     public void waitFor() {
         Method waitFor = getEOTCQMethod();
-        WHITE_BOX.enqueueMethodForCompilation(waitFor, 1);
+        WHITE_BOX.enqueueMethodForCompilation(waitFor, 1, -1);
         for (int i = 0; i < 200; i++)
             if (waitFor0(waitFor))
                 break;
@@ -190,13 +207,13 @@ public class Warmup {
         } catch (NoSuchMethodException e) {
             throw new AssertionError(e);
         }
-        assert WHITE_BOX.isMethodCompilable(waitFor);
+        assert WHITE_BOX.isMethodCompilable(waitFor) || WHITE_BOX == NoWhiteBox.INSTANCE;
         return waitFor;
     }
 
     private boolean waitFor0(Method waitFor) {
         try {
-            if (WHITE_BOX.isMethodCompiled(waitFor)) {
+            if (WHITE_BOX.isMethodCompiled(waitFor) || !WHITE_BOX.isMethodCompilable(waitFor)) {
                 return true;
             }
             Thread.sleep(10);
