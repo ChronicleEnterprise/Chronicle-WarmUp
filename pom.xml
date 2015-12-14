@@ -2,7 +2,7 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>chronicle.software</groupId>
     <artifactId>chronicle-warmup</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
+    <version>1.0.0</version>
     <name>ChronicleEnterprise/Chronicle-WarmUp</name>
     <description>Chronicle WarmUp</description>
 
